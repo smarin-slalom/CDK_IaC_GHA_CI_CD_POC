@@ -1,0 +1,267 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# .github/workflows/deploy-ecs.yml
+#
+# Stack 3 – ECS Cluster (Fargate, IAM roles, log group, task security group)
+#
+# Prerequisites: EnvironmentStack AND ClientInfraStack must be deployed first.
+#
+# Triggers
+# ────────
+#   • Push to main/master that touches stacks/ecs-stack.ts or
+#     constructs/compute/**
+#   • Manual dispatch (workflow_dispatch)
+#   • Called by the full-pipeline workflow (deploy-all.yml)
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Deploy › ECS Stack
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "stacks/ecs-stack.ts"
+      - "constructs/compute/**"
+      - "config/**"
+      - "bin/app.ts"
+
+  workflow_dispatch:
+    inputs:
+      aws_region:
+        description: "AWS region to deploy to"
+        required: true
+        type: choice
+        options:
+          - us-east-1
+          - us-west-2
+          - eu-west-1
+          - eu-central-1
+          - ap-southeast-1
+        default: us-east-1
+
+      environment:
+        description: "Deployment environment"
+        required: true
+        type: choice
+        options:
+          - poc
+          - staging
+          - production
+        default: poc
+
+      action:
+        description: "Action to perform"
+        required: true
+        type: choice
+        options:
+          - deploy
+          - destroy
+        default: deploy
+
+  workflow_call:
+    inputs:
+      aws_region:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+      action:
+        required: false
+        type: string
+        default: deploy
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+
+concurrency:
+  group: "ecs-${{ github.ref }}-${{ inputs.aws_region || 'us-east-1' }}"
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+
+  resolve_inputs:
+    name: Resolve deployment inputs
+    runs-on: ubuntu-latest
+    outputs:
+      aws_region:  ${{ steps.set.outputs.aws_region }}
+      environment: ${{ steps.set.outputs.environment }}
+      action:      ${{ steps.set.outputs.action }}
+
+    steps:
+      - name: Set inputs
+        id: set
+        run: |
+          REGION="${{ inputs.aws_region || vars.DEFAULT_AWS_REGION || 'us-east-1' }}"
+          ENV="${{ inputs.environment || vars.DEFAULT_ENVIRONMENT || 'poc' }}"
+          ACTION="${{ inputs.action || 'deploy' }}"
+          echo "aws_region=$REGION"  >> "$GITHUB_OUTPUT"
+          echo "environment=$ENV"    >> "$GITHUB_OUTPUT"
+          echo "action=$ACTION"      >> "$GITHUB_OUTPUT"
+          echo "🌍 Region: $REGION | Env: $ENV | Action: $ACTION"
+
+  # ── Pre-flight: both upstream stacks must have written their SSM params ───
+  preflight_check:
+    name: Pre-flight › Verify upstream SSM outputs
+    needs: resolve_inputs
+    if: needs.resolve_inputs.outputs.action == 'deploy'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve_inputs.outputs.environment }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ needs.resolve_inputs.outputs.aws_region }}
+          role-session-name: "preflight-ecs-${{ github.run_id }}"
+
+      - name: Check upstream SSM parameters
+        run: |
+          PROJECT="migration-poc"
+          ENV="${{ needs.resolve_inputs.outputs.environment }}"
+
+          declare -A REQUIRED_PARAMS=(
+            ["/$PROJECT/$ENV/environment/vpcId"]="EnvironmentStack"
+            ["/$PROJECT/$ENV/environment/privateSubnetIds"]="EnvironmentStack"
+            ["/$PROJECT/$ENV/environment/privateSecurityGroupId"]="EnvironmentStack"
+            ["/$PROJECT/$ENV/client-infra/albArn"]="ClientInfraStack"
+            ["/$PROJECT/$ENV/client-infra/albSecurityGroupId"]="ClientInfraStack"
+            ["/$PROJECT/$ENV/client-infra/httpListenerArn"]="ClientInfraStack"
+          )
+
+          FAILED=0
+          for PARAM in "${!REQUIRED_PARAMS[@]}"; do
+            SOURCE="${REQUIRED_PARAMS[$PARAM]}"
+            VALUE=$(aws ssm get-parameter \
+              --name "$PARAM" \
+              --query 'Parameter.Value' \
+              --output text 2>/dev/null || echo "MISSING")
+            if [ "$VALUE" = "MISSING" ]; then
+              echo "❌ MISSING ($SOURCE): $PARAM"
+              FAILED=$((FAILED + 1))
+            else
+              echo "✅ OK ($SOURCE): $PARAM"
+            fi
+          done
+
+          if [ $FAILED -gt 0 ]; then
+            echo "::error::$FAILED upstream SSM parameter(s) missing."
+            echo "::error::Deploy EnvironmentStack then ClientInfraStack before EcsStack."
+            exit 1
+          fi
+          echo "✅ All pre-flight checks passed"
+
+  # ── Deploy EcsStack ───────────────────────────────────────────────────────
+  deploy:
+    name: "CDK ${{ needs.resolve_inputs.outputs.action }} EcsStack"
+    needs: [resolve_inputs, preflight_check]
+    if: |
+      always() &&
+      needs.resolve_inputs.result == 'success' &&
+      (needs.preflight_check.result == 'success' || needs.preflight_check.result == 'skipped')
+    uses: ./.github/workflows/cdk-deploy-reusable.yml
+    with:
+      stack_name:       EcsStack
+      stack_name_full:  "migration-poc-${{ needs.resolve_inputs.outputs.environment }}-ecs"
+      aws_region:       ${{ needs.resolve_inputs.outputs.aws_region }}
+      environment:      ${{ needs.resolve_inputs.outputs.environment }}
+      working_dir:      "."
+      action:           ${{ needs.resolve_inputs.outputs.action }}
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
+  # ── Post-deploy verification ──────────────────────────────────────────────
+  verify_cluster:
+    name: Verify ECS cluster is ACTIVE
+    needs: [resolve_inputs, deploy]
+    if: needs.resolve_inputs.outputs.action == 'deploy'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve_inputs.outputs.environment }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ needs.resolve_inputs.outputs.aws_region }}
+          role-session-name: "verify-ecs-${{ github.run_id }}"
+
+      - name: Verify ECS SSM outputs and cluster status
+        run: |
+          PROJECT="migration-poc"
+          ENV="${{ needs.resolve_inputs.outputs.environment }}"
+          PREFIX="/$PROJECT/$ENV/ecs"
+
+          PARAMS=(
+            "clusterName"
+            "clusterArn"
+            "taskExecutionRoleArn"
+            "taskRoleArn"
+            "logGroupName"
+            "taskSecurityGroupId"
+          )
+
+          FAILED=0
+          for PARAM in "${PARAMS[@]}"; do
+            VALUE=$(aws ssm get-parameter \
+              --name "$PREFIX/$PARAM" \
+              --query 'Parameter.Value' \
+              --output text 2>/dev/null || echo "MISSING")
+            if [ "$VALUE" = "MISSING" ]; then
+              echo "❌ MISSING: $PREFIX/$PARAM"
+              FAILED=$((FAILED + 1))
+            else
+              echo "✅ OK: $PREFIX/$PARAM = ${VALUE:0:80}"
+            fi
+          done
+
+          if [ $FAILED -gt 0 ]; then
+            echo "::error::$FAILED SSM parameter(s) missing"
+            exit 1
+          fi
+
+          # Verify the ECS cluster itself is ACTIVE
+          CLUSTER_NAME=$(aws ssm get-parameter \
+            --name "$PREFIX/clusterName" \
+            --query 'Parameter.Value' \
+            --output text)
+
+          CLUSTER_STATUS=$(aws ecs describe-clusters \
+            --clusters "$CLUSTER_NAME" \
+            --query 'clusters[0].status' \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+
+          echo "🔍 Cluster: $CLUSTER_NAME | Status: $CLUSTER_STATUS"
+
+          if [ "$CLUSTER_STATUS" != "ACTIVE" ]; then
+            echo "::error::ECS cluster status is '$CLUSTER_STATUS', expected ACTIVE"
+            exit 1
+          fi
+
+          echo "✅ ECS cluster is ACTIVE and ready for service deployments"
+
+      - name: Print deployment summary
+        run: |
+          PROJECT="migration-poc"
+          ENV="${{ needs.resolve_inputs.outputs.environment }}"
+          PREFIX="/$PROJECT/$ENV/ecs"
+
+          CLUSTER=$(aws ssm get-parameter --name "$PREFIX/clusterName" --query 'Parameter.Value' --output text)
+          LOG_GROUP=$(aws ssm get-parameter --name "$PREFIX/logGroupName" --query 'Parameter.Value' --output text)
+
+          echo "## ECS Stack Deployed Successfully 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource     | Value |"  >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|-------|"   >> $GITHUB_STEP_SUMMARY
+          echo "| Cluster     | \`$CLUSTER\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Log Group   | \`$LOG_GROUP\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Region      | ${{ needs.resolve_inputs.outputs.aws_region }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${{ needs.resolve_inputs.outputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "App services can now be deployed from their respective repositories." >> $GITHUB_STEP_SUMMARY

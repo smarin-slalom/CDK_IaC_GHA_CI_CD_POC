@@ -1,0 +1,155 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# .github/workflows/deploy-all.yml
+#
+# Full pipeline – deploys all three stacks in the correct order:
+#   1. EnvironmentStack  (VPC, networking foundation)
+#   2. ClientInfraStack  (NAT Gateway, ALB)
+#   3. EcsStack          (Fargate cluster, IAM, log group)
+#
+# Each stage gates on the previous one.  A failure stops the pipeline.
+#
+# Trigger: manual dispatch only (for the POC).
+#          In production, wire this to a release tag or an approval gate.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Deploy › Full Pipeline (All Stacks)
+
+on:
+  workflow_dispatch:
+    inputs:
+      aws_region:
+        description: "AWS region to deploy to"
+        required: true
+        type: choice
+        options:
+          - us-east-1
+          - us-west-2
+          - eu-west-1
+          - eu-central-1
+          - ap-southeast-1
+        default: us-east-1
+
+      environment:
+        description: "Deployment environment"
+        required: true
+        type: choice
+        options:
+          - poc
+          - staging
+          - production
+        default: poc
+
+      action:
+        description: "Action to perform (destroy runs in reverse order)"
+        required: true
+        type: choice
+        options:
+          - deploy
+          - destroy
+        default: deploy
+
+      certificate_arn:
+        description: "ACM certificate ARN for HTTPS (optional)"
+        required: false
+        type: string
+        default: ""
+
+      skip_environment:
+        description: "Skip EnvironmentStack (already deployed)"
+        required: false
+        type: boolean
+        default: false
+
+      skip_client_infra:
+        description: "Skip ClientInfraStack (already deployed)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: "full-pipeline-${{ github.ref }}-${{ inputs.aws_region }}-${{ inputs.environment }}"
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # DEPLOY order: 1 → 2 → 3
+  # DESTROY order: 3 → 2 → 1  (handled by individual jobs with `needs` gates)
+  # ─────────────────────────────────────────────────────────────────────────
+
+  # ── Stage 1: Environment ─────────────────────────────────────────────────
+  environment_stack:
+    name: "Stage 1 › Environment Stack"
+    if: ${{ !inputs.skip_environment }}
+    uses: ./.github/workflows/deploy-environment.yml
+    with:
+      aws_region:  ${{ inputs.aws_region }}
+      environment: ${{ inputs.environment }}
+      action:      ${{ inputs.action }}
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
+  # ── Stage 2: Client Infra (waits for Stage 1) ────────────────────────────
+  client_infra_stack:
+    name: "Stage 2 › Client Infra Stack"
+    needs: environment_stack
+    if: |
+      always() &&
+      !inputs.skip_client_infra &&
+      (needs.environment_stack.result == 'success' || inputs.skip_environment)
+    uses: ./.github/workflows/deploy-client-infra.yml
+    with:
+      aws_region:      ${{ inputs.aws_region }}
+      environment:     ${{ inputs.environment }}
+      action:          ${{ inputs.action }}
+      certificate_arn: ${{ inputs.certificate_arn }}
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
+  # ── Stage 3: ECS (waits for Stage 2) ─────────────────────────────────────
+  ecs_stack:
+    name: "Stage 3 › ECS Stack"
+    needs: client_infra_stack
+    if: |
+      always() &&
+      (needs.client_infra_stack.result == 'success' || inputs.skip_client_infra)
+    uses: ./.github/workflows/deploy-ecs.yml
+    with:
+      aws_region:  ${{ inputs.aws_region }}
+      environment: ${{ inputs.environment }}
+      action:      ${{ inputs.action }}
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
+  # ── Final summary ─────────────────────────────────────────────────────────
+  pipeline_summary:
+    name: Pipeline Summary
+    needs: [environment_stack, client_infra_stack, ecs_stack]
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Print final summary
+        run: |
+          ENV_RESULT="${{ needs.environment_stack.result }}"
+          CLIENT_RESULT="${{ needs.client_infra_stack.result }}"
+          ECS_RESULT="${{ needs.ecs_stack.result }}"
+
+          overall="✅ SUCCESS"
+          if [ "$ENV_RESULT" = "failure" ] || [ "$CLIENT_RESULT" = "failure" ] || [ "$ECS_RESULT" = "failure" ]; then
+            overall="❌ FAILED"
+          fi
+
+          echo "## Full Pipeline Summary $overall" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage              | Status                |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------------------|----------------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 1. EnvironmentStack | $ENV_RESULT          |" >> $GITHUB_STEP_SUMMARY
+          echo "| 2. ClientInfraStack | $CLIENT_RESULT       |" >> $GITHUB_STEP_SUMMARY
+          echo "| 3. EcsStack         | $ECS_RESULT          |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Region:** ${{ inputs.aws_region }} | **Environment:** ${{ inputs.environment }} | **Action:** ${{ inputs.action }}" >> $GITHUB_STEP_SUMMARY
