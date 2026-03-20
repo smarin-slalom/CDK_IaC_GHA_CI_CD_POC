@@ -282,19 +282,18 @@ export class AppServiceStack extends cdk.Stack {
       serviceName: namePrefix,
       cluster,
       taskDefinition: this.taskDefinition,
-      desiredCount: config.scaling.minCapacity, // start at min
+      desiredCount: config.scaling.minCapacity,
       vpcSubnets: { subnets: privateSubnets },
       securityGroups: [taskSecurityGroup],
-      assignPublicIp: false,                    // private subnet behind ALB
+      assignPublicIp: false,
       capacityProviderStrategies: [
-        // Prefer Fargate (on-demand); spill into Fargate Spot for cost savings
         { capacityProvider: 'FARGATE',      weight: 1, base: config.scaling.minCapacity },
         { capacityProvider: 'FARGATE_SPOT', weight: 4, base: 0 },
       ],
       healthCheckGracePeriod: cdk.Duration.seconds(
         config.albRouting.healthCheckGracePeriodSec ?? 60,
       ),
-      enableExecuteCommand: true,               // allows `ecs execute-command` for debugging
+      enableExecuteCommand: true,
       circuitBreaker: {
         enable: true,
         rollback: true,
@@ -302,12 +301,14 @@ export class AppServiceStack extends cdk.Stack {
       deploymentController: {
         type: ecs.DeploymentControllerType.ECS,
       },
-      loadBalancers: [{
-        targetGroupArn: this.targetGroup.targetGroupArn,
-        containerName: container.containerName,
-        containerPort: config.container.containerPort,
-      }],
+      // CDK v2: loadBalancers is not a FargateServiceProps field.
+      // Wire the target group after construction via addTarget() below.
     });
+
+    // Register the service as a target of the ALB target group.
+    // This is the correct CDK v2 pattern – it calls registerLoadBalancerTargets
+    // on the task definition internally.
+    this.targetGroup.addTarget(this.service);
 
     // ── Auto-Scaling ──────────────────────────────────────────────────────
     // Per spec:
@@ -316,62 +317,76 @@ export class AppServiceStack extends cdk.Stack {
     //   • Scale OUT: CPU > 80%  → add 1 task (60 s cooldown)
     //   • Scale IN:  CPU < 20%  → remove 1 task (300 s cooldown)
 
+    // ── Auto-Scaling ──────────────────────────────────────────────────────
+    // Per spec:
+    //   • Minimum tasks: 2  (always 2 running per region)
+    //   • Maximum tasks: configurable per app
+    //   • Scale OUT: CPU > 80%  → +1 task, 60 s cooldown
+    //   • Scale IN:  CPU < 20%  → −1 task, 300 s cooldown
+    //
+    // We use StepScalingAction (low-level) rather than StepScalingPolicy
+    // (high-level) because we need separate cooldowns per direction and want
+    // to own the CloudWatch alarms ourselves.
+
     const scalableTarget = this.service.autoScaleTaskCount({
       minCapacity: config.scaling.minCapacity,
       maxCapacity: config.scaling.maxCapacity,
     });
 
-    // Scale OUT policy – triggered when CPU exceeds the upper threshold
+    // ── Scale-OUT action (+1 task when CPU is high) ───────────────────────
+    const scaleOutAction = new appscaling.StepScalingAction(this, 'ScaleOutAction', {
+      scalingTarget,
+      adjustmentType: appscaling.AdjustmentType.CHANGE_IN_CAPACITY,
+      cooldown: cdk.Duration.seconds(config.scaling.scaleOutCooldownSec),
+      metricAggregationType: appscaling.MetricAggregationType.AVERAGE,
+    });
+    // lowerBound: 0 means "add 1 task for any breach above the alarm threshold"
+    scaleOutAction.addAdjustment({ adjustment: +1, lowerBound: 0 });
+
+    // ── Scale-IN action (−1 task when CPU is low) ─────────────────────────
+    const scaleInAction = new appscaling.StepScalingAction(this, 'ScaleInAction', {
+      scalingTarget,
+      adjustmentType: appscaling.AdjustmentType.CHANGE_IN_CAPACITY,
+      cooldown: cdk.Duration.seconds(config.scaling.scaleInCooldownSec),
+      metricAggregationType: appscaling.MetricAggregationType.AVERAGE,
+    });
+    // upperBound: 0 means "remove 1 task for any breach below the alarm threshold"
+    scaleInAction.addAdjustment({ adjustment: -1, upperBound: 0 });
+
+    // ── CloudWatch Alarms ─────────────────────────────────────────────────
+    const cpuMetric = this.service.metricCpuUtilization({
+      period: cdk.Duration.minutes(1),
+    });
+
     const scaleOutAlarm = new cdk.aws_cloudwatch.Alarm(this, 'ScaleOutAlarm', {
-      metric: this.service.metricCpuUtilization({ period: cdk.Duration.minutes(1) }),
+      metric: cpuMetric,
       threshold: config.scaling.scaleOutCpuPercent,
       comparisonOperator: cdk.aws_cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
       evaluationPeriods: 2,
       datapointsToAlarm: 2,
       treatMissingData: cdk.aws_cloudwatch.TreatMissingData.NOT_BREACHING,
       alarmName: `${namePrefix}-cpu-high`,
-      alarmDescription: `CPU > ${config.scaling.scaleOutCpuPercent}% – scale out`,
+      alarmDescription: `CPU ≥ ${config.scaling.scaleOutCpuPercent}% – scale out`,
     });
 
     const scaleInAlarm = new cdk.aws_cloudwatch.Alarm(this, 'ScaleInAlarm', {
-      metric: this.service.metricCpuUtilization({ period: cdk.Duration.minutes(1) }),
+      metric: cpuMetric,
       threshold: config.scaling.scaleInCpuPercent,
       comparisonOperator: cdk.aws_cloudwatch.ComparisonOperator.LESS_THAN_OR_EQUAL_TO_THRESHOLD,
       evaluationPeriods: 3,
       datapointsToAlarm: 3,
       treatMissingData: cdk.aws_cloudwatch.TreatMissingData.NOT_BREACHING,
       alarmName: `${namePrefix}-cpu-low`,
-      alarmDescription: `CPU < ${config.scaling.scaleInCpuPercent}% – scale in`,
+      alarmDescription: `CPU ≤ ${config.scaling.scaleInCpuPercent}% – scale in`,
     });
 
-    const scaleOutPolicy = new appscaling.StepScalingPolicy(this, 'ScaleOutPolicy', {
-      scalingTarget: scalableTarget,
-      adjustmentType: appscaling.AdjustmentType.CHANGE_IN_CAPACITY,
-      cooldown: cdk.Duration.seconds(config.scaling.scaleOutCooldownSec),
-      scalingSteps: [
-        { lower: 0, change: +1 },   // add 1 task when alarm triggers
-      ],
-      metric: this.service.metricCpuUtilization({ period: cdk.Duration.minutes(1) }),
-      scalingStepSize: 1,
-    });
-
-    const scaleInPolicy = new appscaling.StepScalingPolicy(this, 'ScaleInPolicy', {
-      scalingTarget: scalableTarget,
-      adjustmentType: appscaling.AdjustmentType.CHANGE_IN_CAPACITY,
-      cooldown: cdk.Duration.seconds(config.scaling.scaleInCooldownSec),
-      scalingSteps: [
-        { upper: 0, change: -1 },   // remove 1 task when alarm triggers
-      ],
-      metric: this.service.metricCpuUtilization({ period: cdk.Duration.minutes(1) }),
-      scalingStepSize: 1,
-    });
-
-    // Wire alarms to policies
+    // Wire alarms → actions
+    // ApplicationScalingAction wraps a StepScalingAction (not StepScalingPolicy)
     scaleOutAlarm.addAlarmAction(
-      new cdk.aws_cloudwatch_actions.ApplicationScalingAction(scaleOutPolicy),
+      new cdk.aws_cloudwatch_actions.ApplicationScalingAction(scaleOutAction),
     );
     scaleInAlarm.addAlarmAction(
-      new cdk.aws_cloudwatch_actions.ApplicationScalingAction(scaleInPolicy),
+      new cdk.aws_cloudwatch_actions.ApplicationScalingAction(scaleInAction),
     );
 
     // ── CloudFormation Outputs ────────────────────────────────────────────

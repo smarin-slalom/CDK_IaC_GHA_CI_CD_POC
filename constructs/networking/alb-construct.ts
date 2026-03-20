@@ -181,21 +181,23 @@ export class AlbConstruct extends Construct {
     const priority = this.listenerRulePriority;
     this.listenerRulePriority += 10;
 
-    if (conditions.length > 0) {
-      this.httpListener.addTargetGroups(`HttpRule${priority}`, {
-        targetGroups: [targetGroup],
-        priority,
-        conditions,
-      });
-      this.httpsListener?.addTargetGroups(`HttpsRule${priority}`, {
-        targetGroups: [targetGroup],
-        priority,
-        conditions,
-      });
-    } else {
-      // No conditions → set as default forward action
-      this.httpListener.addDefaultTargetGroups([targetGroup]);
-      this.httpsListener?.addDefaultTargetGroups([targetGroup]);
-    }
+    // CDK v2: ApplicationListener has no addDefaultTargetGroups().
+    // When no conditions are supplied we use a catch-all path pattern ['/*']
+    // at the current priority so the rule still works correctly.
+    const resolvedConditions: elbv2.ListenerCondition[] =
+      conditions.length > 0
+        ? conditions
+        : [elbv2.ListenerCondition.pathPatterns(['/*'])];
+
+    this.httpListener.addTargetGroups(`HttpRule${priority}`, {
+      targetGroups: [targetGroup],
+      priority,
+      conditions: resolvedConditions,
+    });
+    this.httpsListener?.addTargetGroups(`HttpsRule${priority}`, {
+      targetGroups: [targetGroup],
+      priority,
+      conditions: resolvedConditions,
+    });
   }
 }
